@@ -33,7 +33,7 @@ The agent supports:
 ## Clone the Repository
 
 ```bash
-git clone https://github.com/your-org/llama-kb-agent.git
+git clone https://github.com/gaswani/llama-kb-agent.git
 cd llama-kb-agent
 ```
 
