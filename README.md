@@ -129,6 +129,7 @@ pip install -r requirements.txt
 GROQ_API_KEY=your_groq_api_key_here
 HYBRID_SEARCH=true
 HYBRID_ALPHA=0.70
+HYBRID_THRESHOLD=0.35
 ```
 
 ---
