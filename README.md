@@ -117,7 +117,7 @@ http://127.0.0.1:8000/
 
 ---
 
-## 📘 OpenAPI / Swagger Documentation
+## OpenAPI / Swagger Documentation
 
 ### Swagger UI
 ```
