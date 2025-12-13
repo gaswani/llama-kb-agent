@@ -1,21 +1,27 @@
+# Copyright (c) 2025 Gideon Aswani / Pathways Technologies Ltd
+# Licensed under the MIT License. See LICENSE file for details.
+
 import os
 import io
 import json
 import uuid
 import tempfile
 from datetime import datetime
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Dict, Any, Optional
+import re
 
 import numpy as np
+import docx  # python-docx
+
 from flask import Flask, request, jsonify, render_template, Response
 from flask_cors import CORS
 
-import docx  # python-docx
-from sentence_transformers import SentenceTransformer
 from groq import Groq
+from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.feature_extraction.text import TfidfVectorizer
 
-# Optional .env support
+# Load .env (recommended)
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -23,25 +29,36 @@ except Exception:
     pass
 
 
-# ---------------- Configuration ----------------
+# =========================
+# Configuration
+# =========================
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 if not GROQ_API_KEY:
-    raise RuntimeError("Please set GROQ_API_KEY in your environment (or .env).")
+    raise RuntimeError(
+        "GROQ_API_KEY not found. Create a .env file with GROQ_API_KEY=your_key_here "
+        "or set it in your environment."
+    )
 
 LLAMA_MODEL = os.getenv("LLAMA_MODEL", "llama-3.3-70b-versatile")
 
 TOP_K = int(os.getenv("TOP_K", "5"))
-SIM_THRESHOLD = float(os.getenv("SIM_THRESHOLD", "0.40"))
+SEMANTIC_THRESHOLD = float(os.getenv("SIM_THRESHOLD", "0.40"))
 
-# KB storage (disk)
+# Hybrid search controls
+HYBRID_SEARCH = os.getenv("HYBRID_SEARCH", "true").lower() == "true"
+HYBRID_ALPHA = float(os.getenv("HYBRID_ALPHA", "0.70"))        # 0..1 (semantic weight)
+HYBRID_THRESHOLD = float(os.getenv("HYBRID_THRESHOLD", "0.35"))  # score floor for hybrid
+
+# KB persistence
 KB_ROOT = os.getenv("KB_ROOT", os.path.join(os.path.dirname(__file__), "kb_store"))
 os.makedirs(KB_ROOT, exist_ok=True)
+CURRENT_KB_FILE = os.path.join(KB_ROOT, "current_kb.json")
 
-CURRENT_KB_FILE = os.path.join(KB_ROOT, "current_kb.json")  # stores {"kb_id": "..."} so we can auto-load
 
-
-# ---------------- Initialize clients/models ----------------
+# =========================
+# Initialize clients/models
+# =========================
 
 llama_client = Groq(api_key=GROQ_API_KEY)
 embedder = SentenceTransformer("all-MiniLM-L6-v2")
@@ -49,34 +66,128 @@ embedder = SentenceTransformer("all-MiniLM-L6-v2")
 # In-memory active KB
 kb_id_active: Optional[str] = None
 kb_chunks: List[str] = []
-kb_embeddings: Optional[np.ndarray] = None  # shape: (n_chunks, dim)
+kb_embeddings: Optional[np.ndarray] = None  # (n_chunks, dim)
+
+# Keyword index (built from kb_chunks)
+tfidf_vectorizer: Optional[TfidfVectorizer] = None
+tfidf_matrix = None  # sparse
 
 
-# ---------------- Helpers: KB parsing, chunking, embeddings ----------------
+# =========================
+# Utility: KB parsing & indexing
+# =========================
 
 def load_docx_text(file_bytes: bytes) -> str:
-    file_stream = io.BytesIO(file_bytes)
-    doc = docx.Document(file_stream)
-    paragraphs = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
-    return "\n\n".join(paragraphs)
+    doc = docx.Document(io.BytesIO(file_bytes))
+
+    parts = []
+
+    # 1) Paragraphs
+    for p in doc.paragraphs:
+        t = (p.text or "").strip()
+        if t:
+            parts.append(t)
+
+    # 2) Tables (this is the big missing piece)
+    for table in doc.tables:
+        for row in table.rows:
+            cells = []
+            for cell in row.cells:
+                ct = (cell.text or "").strip()
+                if ct:
+                    # Normalize whitespace within a cell
+                    ct = " ".join(ct.split())
+                    cells.append(ct)
+            if cells:
+                # Use a separator so keyword search works well
+                parts.append(" | ".join(cells))
+
+    # Cleanup common junk
+    cleaned = []
+    for x in parts:
+        if x.lower() in {"bottom of form", "top of form"}:
+            continue
+        cleaned.append(x)
+
+    return "\n\n".join(cleaned)
 
 
-def chunk_text(text: str, max_chars: int = 900) -> List[str]:
-    paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
-    chunks: List[str] = []
-    current = ""
+def chunk_text(text: str, max_chars: int = 700, overlap: int = 120) -> List[str]:
+    """
+    Better chunking for Word docs:
+    - Splits by blank lines first
+    - Treats headings as boundaries (e.g., numbered, ALL CAPS, short title lines)
+    - Hard-splits very long blocks with overlap to avoid 1-chunk KB
+    """
+    # Normalize whitespace
+    text = (text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    blocks = [b.strip() for b in re.split(r"\n\s*\n+", text) if b.strip()]
 
-    for para in paragraphs:
-        if len(current) + len(para) + 2 <= max_chars:
-            current = f"{current}\n\n{para}".strip() if current else para
+    def is_heading(line: str) -> bool:
+        l = line.strip()
+        if not l:
+            return False
+        # Numbered headings like "1.2 Title" or "3 Title"
+        if re.match(r"^\d+(\.\d+)*\s+.+", l):
+            return True
+        # ALL CAPS short-ish lines
+        if len(l) <= 80 and l.upper() == l and any(c.isalpha() for c in l):
+            return True
+        # Title case short-ish lines (common in docs)
+        if len(l) <= 80 and sum(ch.isupper() for ch in l) >= 3 and l.endswith(":"):
+            return True
+        return False
+
+    # First pass: build sections using headings
+    sections: List[str] = []
+    buffer: List[str] = []
+
+    for b in blocks:
+        lines = [ln.strip() for ln in b.split("\n") if ln.strip()]
+        if lines and is_heading(lines[0]) and buffer:
+            sections.append("\n\n".join(buffer).strip())
+            buffer = [b]
         else:
-            if current:
-                chunks.append(current)
-            current = para
+            buffer.append(b)
 
-    if current:
-        chunks.append(current)
-    return chunks
+    if buffer:
+        sections.append("\n\n".join(buffer).strip())
+
+    # Second pass: pack sections into chunks under max_chars
+    chunks: List[str] = []
+    cur = ""
+
+    def flush():
+        nonlocal cur
+        if cur.strip():
+            chunks.append(cur.strip())
+        cur = ""
+
+    for s in sections:
+        if len(s) <= max_chars:
+            if len(cur) + len(s) + 2 <= max_chars:
+                cur = (cur + "\n\n" + s).strip() if cur else s
+            else:
+                flush()
+                cur = s
+        else:
+            # Hard split long section with overlap
+            flush()
+            start = 0
+            while start < len(s):
+                end = min(start + max_chars, len(s))
+                piece = s[start:end].strip()
+                if piece:
+                    chunks.append(piece)
+                if end >= len(s):
+                    break
+                start = max(0, end - overlap)
+
+    flush()
+
+    # Final cleanup: drop tiny chunks
+    cleaned = [c for c in chunks if len(c) >= 80]
+    return cleaned if cleaned else chunks
 
 
 def embed_texts(texts: List[str]) -> np.ndarray:
@@ -85,8 +196,22 @@ def embed_texts(texts: List[str]) -> np.ndarray:
     return embedder.encode(texts, convert_to_numpy=True, normalize_embeddings=True)
 
 
+def build_tfidf_index(chunks: List[str]) -> None:
+    """Build TF-IDF matrix for keyword/lexical matching."""
+    global tfidf_vectorizer, tfidf_matrix
+    if not chunks:
+        tfidf_vectorizer, tfidf_matrix = None, None
+        return
+    tfidf_vectorizer = TfidfVectorizer(
+        lowercase=True,
+        stop_words="english",
+        ngram_range=(1, 2),
+        max_features=50000,
+    )
+    tfidf_matrix = tfidf_vectorizer.fit_transform(chunks)
+
+
 def semantic_search(query: str, top_k: int = TOP_K) -> Tuple[List[str], List[float]]:
-    global kb_chunks, kb_embeddings
     if kb_embeddings is None or kb_embeddings.shape[0] == 0:
         raise ValueError("Knowledge base is empty. Upload or load a KB first.")
 
@@ -94,12 +219,62 @@ def semantic_search(query: str, top_k: int = TOP_K) -> Tuple[List[str], List[flo
     sims = cosine_similarity(q_emb, kb_embeddings)[0]
 
     top_indices = np.argsort(-sims)[:top_k]
+    return [kb_chunks[i] for i in top_indices], [float(sims[i]) for i in top_indices]
+
+
+def hybrid_search(
+    query: str,
+    top_k: int = TOP_K,
+    alpha: Optional[float] = None,
+) -> Tuple[List[str], List[float], Dict[str, Any]]:
+    """
+    Hybrid search: blend semantic similarity with TF-IDF cosine similarity.
+
+    score = alpha * semantic + (1 - alpha) * keyword
+    """
+    if alpha is None:
+        alpha = HYBRID_ALPHA
+
+    if kb_embeddings is None or kb_embeddings.shape[0] == 0:
+        raise ValueError("Knowledge base is empty. Upload or load a KB first.")
+
+    # Semantic scores
+    q_emb = embed_texts([query])[0].reshape(1, -1)
+    sem = cosine_similarity(q_emb, kb_embeddings)[0]  # shape: (n,)
+
+    # Keyword scores (TF-IDF cosine similarity)
+    kw = None
+    if tfidf_vectorizer is not None and tfidf_matrix is not None:
+        q_t = tfidf_vectorizer.transform([query])
+        kw = (q_t @ tfidf_matrix.T).toarray()[0]  # cosine for L2-normalized tfidf
+        # NOTE: scikit TFIDF vectors are L2-normalized by default => dot product ~ cosine.
+    else:
+        kw = np.zeros_like(sem)
+
+    combined = alpha * sem + (1.0 - alpha) * kw
+    top_indices = np.argsort(-combined)[:top_k]
+
     top_chunks = [kb_chunks[i] for i in top_indices]
-    top_scores = [float(sims[i]) for i in top_indices]
-    return top_chunks, top_scores
+    top_scores = [float(combined[i]) for i in top_indices]
+
+    debug = {
+        "alpha": alpha,
+        "top": [
+            {
+                "idx": int(i),
+                "combined": float(combined[i]),
+                "semantic": float(sem[i]),
+                "keyword": float(kw[i]),
+            }
+            for i in top_indices
+        ],
+    }
+    return top_chunks, top_scores, debug
 
 
-# ---------------- Helpers: LLM prompting ----------------
+# =========================
+# LLM prompting (strict KB grounding)
+# =========================
 
 def build_system_prompt() -> str:
     return (
@@ -135,13 +310,14 @@ def call_llama(question: str, context_chunks: List[str]) -> str:
     return completion.choices[0].message.content.strip()
 
 
-# ---------------- Helpers: audio transcription via Groq Whisper ----------------
+# =========================
+# Audio transcription (Groq-hosted Whisper)
+# =========================
 
 def transcribe_audio_to_text(file_bytes: bytes, ext: str = "m4a") -> str:
     with tempfile.NamedTemporaryFile(suffix=f".{ext}", delete=True) as tmp:
         tmp.write(file_bytes)
         tmp.flush()
-
         with open(tmp.name, "rb") as f:
             transcription = llama_client.audio.transcriptions.create(
                 file=f,
@@ -153,7 +329,9 @@ def transcribe_audio_to_text(file_bytes: bytes, ext: str = "m4a") -> str:
     return text.strip()
 
 
-# ---------------- Helpers: small-talk / agent behavior ----------------
+# =========================
+# Small-talk / agent behavior
+# =========================
 
 def handle_small_talk(query: str) -> Optional[str]:
     q = (query or "").lower().strip()
@@ -163,16 +341,14 @@ def handle_small_talk(query: str) -> Optional[str]:
     if any(q_no_punct.startswith(g) for g in greetings):
         return (
             "Hello! 👋 I'm your document assistant. "
-            "I answer questions *strictly* using the Word document knowledge base you've uploaded. "
+            "I answer questions strictly using the Word document knowledge base you've uploaded. "
             "What would you like to know?"
         )
 
-    if any(p in q_no_punct for p in [
-        "who are you", "what can you do", "what do you do", "who is this", "what is your role"
-    ]):
+    if any(p in q_no_punct for p in ["who are you", "what can you do", "what do you do", "your role"]):
         return (
             "I'm an AI assistant that answers only from the uploaded document. "
-            "Ask me about definitions, sections, policies, procedures, or anything in that document."
+            "Ask me about definitions, sections, programs, partners, locations, or anything in that document."
         )
 
     if "thank" in q_no_punct:
@@ -184,7 +360,9 @@ def handle_small_talk(query: str) -> Optional[str]:
     return None
 
 
-# ---------------- KB persistence helpers ----------------
+# =========================
+# KB persistence helpers
+# =========================
 
 def kb_dir(kb_id: str) -> str:
     return os.path.join(KB_ROOT, kb_id)
@@ -197,10 +375,10 @@ def list_kbs() -> List[str]:
         if os.path.isdir(p) and os.path.exists(os.path.join(p, "meta.json")):
             items.append(name)
 
-    def sort_key(k):
+    def sort_key(k: str) -> str:
         try:
             with open(os.path.join(kb_dir(k), "meta.json"), "r", encoding="utf-8") as f:
-                return json.load(f).get("created_at", "")
+                return (json.load(f) or {}).get("created_at", "")
         except Exception:
             return ""
     return sorted(items, key=sort_key, reverse=True)
@@ -241,7 +419,10 @@ def persist_kb(kb_id: str, source_filename: str, source_bytes: bytes, chunks: Li
         "embedding_dim": int(embeddings.shape[1]) if embeddings.ndim == 2 and embeddings.shape[0] else 0,
         "llama_model": LLAMA_MODEL,
         "top_k": TOP_K,
-        "sim_threshold": SIM_THRESHOLD,
+        "semantic_threshold": SEMANTIC_THRESHOLD,
+        "hybrid_search": HYBRID_SEARCH,
+        "hybrid_alpha": HYBRID_ALPHA,
+        "hybrid_threshold": HYBRID_THRESHOLD,
     }
     with open(os.path.join(d, "meta.json"), "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
@@ -264,12 +445,16 @@ def load_kb_from_disk(kb_id: str) -> None:
     kb_id_active = kb_id
     save_current_kb_id(kb_id)
 
+    # Build keyword index for hybrid search
+    build_tfidf_index(kb_chunks)
+
 
 def clear_kb_memory() -> None:
-    global kb_id_active, kb_chunks, kb_embeddings
+    global kb_id_active, kb_chunks, kb_embeddings, tfidf_vectorizer, tfidf_matrix
     kb_id_active = None
     kb_chunks = []
     kb_embeddings = None
+    tfidf_vectorizer, tfidf_matrix = None, None
 
 
 def auto_load_kb_on_startup() -> None:
@@ -286,7 +471,9 @@ def auto_load_kb_on_startup() -> None:
         load_kb_from_disk(versions[0])
 
 
-# ---------------- Flask app ----------------
+# =========================
+# Flask app
+# =========================
 
 app = Flask(__name__, template_folder="templates", static_folder="static")
 CORS(app)
@@ -294,22 +481,32 @@ CORS(app)
 
 @app.route("/", methods=["GET"])
 def ui():
-    return render_template("index.html", active_kb=kb_id_active)
+    """
+    Serve the Agent UI from templates/index.html (recommended).
+    If templates are missing, show a helpful message.
+    """
+    try:
+        return render_template("index.html", active_kb=kb_id_active)
+    except Exception:
+        return (
+            "<h1>Agent is running ✅</h1>"
+            "<p>UI template not found. Ensure you have <code>templates/index.html</code> "
+            "and <code>static/styles.css</code> in your project.</p>"
+            "<p>API endpoints: <code>/upload_kb</code>, <code>/chat_text</code>, <code>/chat</code>, "
+            "<code>/kb/list</code>, <code>/kb/load</code>, <code>/kb/reload</code>, <code>/docs</code>.</p>"
+        )
 
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "active_kb": kb_id_active})
+    return jsonify({"status": "ok", "active_kb": kb_id_active, "hybrid_search": HYBRID_SEARCH})
 
 
 # -------- KB management endpoints --------
 
 @app.route("/kb/list", methods=["GET"])
 def kb_list():
-    return jsonify({
-        "available_kbs": list_kbs(),
-        "current_kb": kb_id_active
-    })
+    return jsonify({"available_kbs": list_kbs(), "current_kb": kb_id_active})
 
 
 @app.route("/kb/load", methods=["POST"])
@@ -318,12 +515,10 @@ def kb_load():
     kb_id = (data.get("kb_id") or "").strip()
     if not kb_id:
         return jsonify({"error": "kb_id is required"}), 400
-
     try:
         load_kb_from_disk(kb_id)
     except Exception as e:
         return jsonify({"error": str(e)}), 400
-
     return jsonify({"message": "KB loaded", "current_kb": kb_id_active})
 
 
@@ -346,7 +541,6 @@ def kb_reload():
         load_kb_from_disk(kb_id_active)
     except Exception as e:
         return jsonify({"error": str(e)}), 400
-
     return jsonify({"message": "KB reloaded", "current_kb": kb_id_active})
 
 
@@ -364,7 +558,7 @@ def upload_kb():
 
     file_bytes = file.read()
     full_text = load_docx_text(file_bytes)
-    chunks = chunk_text(full_text, max_chars=900)
+    chunks = chunk_text(full_text, max_chars=500)
     if not chunks:
         return jsonify({"error": "No text found in uploaded document"}), 400
 
@@ -376,14 +570,23 @@ def upload_kb():
     persist_kb(kb_id, file.filename, file_bytes, chunks, embeddings)
     load_kb_from_disk(kb_id)
 
-    return jsonify({
-        "message": "Knowledge base uploaded, versioned, and activated.",
-        "kb_id": kb_id_active,
-        "num_chunks": len(kb_chunks),
-    })
+    return jsonify({"message": "Knowledge base uploaded, versioned, and activated.", "kb_id": kb_id_active, "num_chunks": len(kb_chunks)})
 
 
 # -------- Chat endpoints --------
+
+def retrieve_context(query: str) -> Tuple[List[str], List[float], Dict[str, Any]]:
+    """
+    Returns: (chunks, scores, debug)
+    """
+    if HYBRID_SEARCH:
+        chunks, scores, dbg = hybrid_search(query, top_k=TOP_K, alpha=HYBRID_ALPHA)
+        dbg["mode"] = "hybrid"
+        return chunks, scores, dbg
+    else:
+        chunks, scores = semantic_search(query, top_k=TOP_K)
+        return chunks, scores, {"mode": "semantic"}
+
 
 @app.route("/chat_text", methods=["POST"])
 def chat_text():
@@ -394,21 +597,15 @@ def chat_text():
 
     small = handle_small_talk(message)
     if small is not None:
-        return jsonify({
-            "answer": small,
-            "query": message,
-            "used_audio": False,
-            "active_kb": kb_id_active,
-            "top_scores": [],
-            "top_snippets": [],
-        })
+        return jsonify({"answer": small, "query": message, "used_audio": False, "active_kb": kb_id_active, "top_scores": [], "top_snippets": [], "debug": {"mode": "smalltalk"}})
 
     try:
-        context_chunks, scores = semantic_search(message, top_k=TOP_K)
+        context_chunks, scores, dbg = retrieve_context(message)
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
 
-    if not scores or scores[0] < SIM_THRESHOLD:
+    threshold = HYBRID_THRESHOLD if HYBRID_SEARCH else SEMANTIC_THRESHOLD
+    if not scores or scores[0] < threshold:
         return jsonify({
             "answer": "I'm sorry, I couldn't find that in the knowledge base.",
             "query": message,
@@ -416,17 +613,11 @@ def chat_text():
             "active_kb": kb_id_active,
             "top_scores": scores,
             "top_snippets": context_chunks,
+            "debug": dbg,
         })
 
     answer = call_llama(message, context_chunks)
-    return jsonify({
-        "answer": answer,
-        "query": message,
-        "used_audio": False,
-        "active_kb": kb_id_active,
-        "top_scores": scores,
-        "top_snippets": context_chunks,
-    })
+    return jsonify({"answer": answer, "query": message, "used_audio": False, "active_kb": kb_id_active, "top_scores": scores, "top_snippets": context_chunks, "debug": dbg})
 
 
 @app.route("/chat", methods=["POST"])
@@ -448,21 +639,15 @@ def chat():
 
     small = handle_small_talk(query)
     if small is not None:
-        return jsonify({
-            "answer": small,
-            "query": query,
-            "used_audio": used_audio,
-            "active_kb": kb_id_active,
-            "top_scores": [],
-            "top_snippets": [],
-        })
+        return jsonify({"answer": small, "query": query, "used_audio": used_audio, "active_kb": kb_id_active, "top_scores": [], "top_snippets": [], "debug": {"mode": "smalltalk"}})
 
     try:
-        context_chunks, scores = semantic_search(query, top_k=TOP_K)
+        context_chunks, scores, dbg = retrieve_context(query)
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
 
-    if not scores or scores[0] < SIM_THRESHOLD:
+    threshold = HYBRID_THRESHOLD if HYBRID_SEARCH else SEMANTIC_THRESHOLD
+    if not scores or scores[0] < threshold:
         return jsonify({
             "answer": "I'm sorry, I couldn't find that in the knowledge base.",
             "query": query,
@@ -470,229 +655,47 @@ def chat():
             "active_kb": kb_id_active,
             "top_scores": scores,
             "top_snippets": context_chunks,
+            "debug": dbg,
         })
 
     answer = call_llama(query, context_chunks)
-    return jsonify({
-        "answer": answer,
-        "query": query,
-        "used_audio": used_audio,
-        "active_kb": kb_id_active,
-        "top_scores": scores,
-        "top_snippets": context_chunks,
-    })
-# -------- OpenAPI / Swagger UI endpoints --------
+    return jsonify({"answer": answer, "query": query, "used_audio": used_audio, "active_kb": kb_id_active, "top_scores": scores, "top_snippets": context_chunks, "debug": dbg})
 
-OPENAPI_SPEC = {
-  "openapi": "3.0.3",
-  "info": {
-    "title": "Llama KB Agent API",
-    "version": "1.0.0",
-    "description": "Flask-based AI agent that answers strictly from an uploaded Word (.docx) knowledge base."
-  },
-  "servers": [
-    {"url": "http://127.0.0.1:8000", "description": "Local dev"},
-  ],
-  "paths": {
-    "/": {
-      "get": {
-        "summary": "Web UI",
-        "description": "Serves the chat UI.",
-        "responses": {"200": {"description": "HTML page"}}
-      }
-    },
-    "/health": {
-      "get": {
-        "summary": "Health check",
-        "responses": {
-          "200": {
-            "description": "OK",
-            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Health"}}}
-          }
-        }
-      }
-    },
 
-    "/upload_kb": {
-      "post": {
-        "summary": "Upload Knowledge Base (.docx)",
-        "description": "Uploads a Word document, chunks it, embeds it, saves it as a new version, and activates it.",
-        "requestBody": {
-          "required": True,
-          "content": {
-            "multipart/form-data": {
-              "schema": {
-                "type": "object",
-                "properties": {
-                  "file": {"type": "string", "format": "binary"}
-                },
-                "required": ["file"]
-              }
-            }
-          }
-        },
-        "responses": {
-          "200": {"description": "Uploaded & activated", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/UploadKBResponse"}}}},
-          "400": {"description": "Bad request", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}},
-        }
-      }
-    },
+# =========================
+# OpenAPI / Swagger UI
+# =========================
 
-    "/kb/list": {
-      "get": {
-        "summary": "List KB versions",
-        "responses": {
-          "200": {"description": "KB list", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/KBListResponse"}}}}
-        }
-      }
+OPENAPI_SPEC: Dict[str, Any] = {
+    "openapi": "3.0.3",
+    "info": {
+        "title": "Llama KB Agent API",
+        "version": "1.0.0",
+        "description": "Flask-based AI agent that answers strictly from an uploaded Word (.docx) knowledge base.",
     },
-    "/kb/load": {
-      "post": {
-        "summary": "Load a KB version",
-        "requestBody": {
-          "required": True,
-          "content": {"application/json": {"schema": {"$ref": "#/components/schemas/KBLoadRequest"}}}
-        },
-        "responses": {
-          "200": {"description": "Loaded", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/KBLoadResponse"}}}},
-          "400": {"description": "Bad request", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}},
-        }
-      }
+    "servers": [{"url": "http://127.0.0.1:8000", "description": "Local dev"}],
+    "paths": {
+        "/": {"get": {"summary": "Web UI", "responses": {"200": {"description": "HTML page"}}}},
+        "/health": {"get": {"summary": "Health check", "responses": {"200": {"description": "OK"}}}},
+        "/upload_kb": {"post": {"summary": "Upload Knowledge Base (.docx)"}},
+        "/kb/list": {"get": {"summary": "List KB versions"}},
+        "/kb/load": {"post": {"summary": "Load a KB version"}},
+        "/kb/clear": {"post": {"summary": "Clear KB from memory"}},
+        "/kb/reload": {"post": {"summary": "Reload active KB from disk"}},
+        "/chat_text": {"post": {"summary": "Chat (text JSON)"}},
+        "/chat": {"post": {"summary": "Chat (multipart: audio or text form)"}},
     },
-    "/kb/clear": {
-      "post": {
-        "summary": "Clear KB from memory",
-        "responses": {
-          "200": {"description": "Cleared", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/KBLoadResponse"}}}}
-        }
-      }
-    },
-    "/kb/reload": {
-      "post": {
-        "summary": "Reload active KB from disk",
-        "responses": {
-          "200": {"description": "Reloaded", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/KBLoadResponse"}}}},
-          "400": {"description": "Bad request", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}},
-        }
-      }
-    },
-
-    "/chat_text": {
-      "post": {
-        "summary": "Chat (text JSON)",
-        "requestBody": {
-          "required": True,
-          "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ChatTextRequest"}}}
-        },
-        "responses": {
-          "200": {"description": "Answer", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ChatResponse"}}}},
-          "400": {"description": "Bad request", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}},
-        }
-      }
-    },
-
-    "/chat": {
-      "post": {
-        "summary": "Chat (multipart: audio or text form)",
-        "description": "Send either an audio file (recommended) or a form field `message`.",
-        "requestBody": {
-          "required": True,
-          "content": {
-            "multipart/form-data": {
-              "schema": {
-                "type": "object",
-                "properties": {
-                  "audio": {"type": "string", "format": "binary", "description": "Audio file (.wav, .m4a, etc.)"},
-                  "message": {"type": "string", "description": "Optional if audio is provided"}
-                }
-              }
-            }
-          }
-        },
-        "responses": {
-          "200": {"description": "Answer", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ChatResponse"}}}},
-          "400": {"description": "Bad request", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}},
-        }
-      }
-    },
-  },
-  "components": {
-    "schemas": {
-      "Error": {
-        "type": "object",
-        "properties": {"error": {"type": "string"}},
-        "required": ["error"]
-      },
-      "Health": {
-        "type": "object",
-        "properties": {
-          "status": {"type": "string"},
-          "active_kb": {"type": ["string", "null"]}
-        },
-        "required": ["status", "active_kb"]
-      },
-      "UploadKBResponse": {
-        "type": "object",
-        "properties": {
-          "message": {"type": "string"},
-          "kb_id": {"type": ["string", "null"]},
-          "num_chunks": {"type": "integer"}
-        },
-        "required": ["message", "kb_id", "num_chunks"]
-      },
-      "KBListResponse": {
-        "type": "object",
-        "properties": {
-          "available_kbs": {"type": "array", "items": {"type": "string"}},
-          "current_kb": {"type": ["string", "null"]}
-        },
-        "required": ["available_kbs", "current_kb"]
-      },
-      "KBLoadRequest": {
-        "type": "object",
-        "properties": {"kb_id": {"type": "string"}},
-        "required": ["kb_id"]
-      },
-      "KBLoadResponse": {
-        "type": "object",
-        "properties": {
-          "message": {"type": "string"},
-          "current_kb": {"type": ["string", "null"]}
-        },
-        "required": ["message", "current_kb"]
-      },
-      "ChatTextRequest": {
-        "type": "object",
-        "properties": {"message": {"type": "string"}},
-        "required": ["message"]
-      },
-      "ChatResponse": {
-        "type": "object",
-        "properties": {
-          "answer": {"type": "string"},
-          "query": {"type": "string"},
-          "used_audio": {"type": "boolean"},
-          "active_kb": {"type": ["string", "null"]},
-          "top_scores": {"type": "array", "items": {"type": "number"}},
-          "top_snippets": {"type": "array", "items": {"type": "string"}}
-        },
-        "required": ["answer", "query", "used_audio", "active_kb", "top_scores", "top_snippets"]
-      }
-    }
-  }
 }
 
 
 @app.route("/openapi.json", methods=["GET"])
 def openapi_json():
-    # You can optionally update servers dynamically if behind a reverse proxy.
     return jsonify(OPENAPI_SPEC)
 
 
 @app.route("/docs", methods=["GET"])
 def swagger_ui():
-    # Swagger UI via CDN (no extra Python deps)
-    html = f"""
+    html = """
 <!doctype html>
 <html>
 <head>
@@ -700,21 +703,19 @@ def swagger_ui():
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <title>API Docs - Llama KB Agent</title>
   <link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@5/swagger-ui.css">
-  <style>
-    body {{ margin:0; }}
-  </style>
+  <style>body { margin:0; }</style>
 </head>
 <body>
   <div id="swagger-ui"></div>
   <script src="https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js"></script>
   <script>
-    window.onload = () => {{
-      SwaggerUIBundle({{
+    window.onload = () => {
+      SwaggerUIBundle({
         url: "/openapi.json",
         dom_id: "#swagger-ui",
         deepLinking: true,
-      }});
-    }};
+      });
+    };
   </script>
 </body>
 </html>
@@ -722,7 +723,7 @@ def swagger_ui():
     return Response(html, mimetype="text/html")
 
 
-# Auto-load KB when server starts
+# Auto-load the most recent KB (if any) when the server starts
 try:
     auto_load_kb_on_startup()
 except Exception:
