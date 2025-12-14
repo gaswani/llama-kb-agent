@@ -340,19 +340,20 @@ def handle_small_talk(query: str) -> Optional[str]:
     greetings = ["hi", "hello", "hey", "good morning", "good afternoon", "good evening"]
     if any(q_no_punct.startswith(g) for g in greetings):
         return (
-            "Hello! 👋 I'm your document assistant. "
-            "I answer questions strictly using the Word document knowledge base you've uploaded. "
-            "What would you like to know?"
+            "Hello! 👋 I'm your AI document assistant. "
+            "I answer questions strictly using the Digital Hubs- Implementation Status knowledge base. "
+            "What would you like to know? "
         )
 
-    if any(p in q_no_punct for p in ["who are you", "what can you do", "what do you do", "your role"]):
+    if any(p in q_no_punct for p in ["who are you", "what can you do", "what do you do", "your role","your knowledge base"]):
         return (
-            "I'm an AI assistant that answers only from the uploaded document. "
-            "Ask me about definitions, sections, programs, partners, locations, or anything in that document."
+            "👋I'm your AI assistant that answers only from the uploaded knowledge base. "
+            "My curent knowledge base is the Digital Hubs- Implementation Status. "
+            "Ask me about definitions, sections, programs, partners, locations, or anything in that document😊."
         )
 
     if "thank" in q_no_punct:
-        return "You're welcome! 😊 Ask me anything else from the document."
+        return "You're welcome! 😊 Ask me anything else about Digital Hubs- Implementation Status."
 
     if any(p in q_no_punct for p in ["bye", "goodbye", "see you", "see ya"]):
         return "Goodbye! 👋 Come back anytime you need help with the document."
