@@ -314,19 +314,29 @@ def call_llama(question: str, context_chunks: List[str]) -> str:
 # Audio transcription (Groq-hosted Whisper)
 # =========================
 
-def transcribe_audio_to_text(file_bytes: bytes, ext: str = "m4a") -> str:
-    with tempfile.NamedTemporaryFile(suffix=f".{ext}", delete=True) as tmp:
-        tmp.write(file_bytes)
-        tmp.flush()
-        with open(tmp.name, "rb") as f:
+def transcribe_audio_to_text(file_bytes: bytes, ext: str = "wav") -> str:
+    tmp_path = None
+    try:
+        # Create temp file path (Windows-safe: close file before reopening)
+        fd, tmp_path = tempfile.mkstemp(suffix=f".{ext}")
+        with os.fdopen(fd, "wb") as tmp:
+            tmp.write(file_bytes)
+
+        # Now reopen for Groq Whisper
+        with open(tmp_path, "rb") as f:
             transcription = llama_client.audio.transcriptions.create(
                 file=f,
                 model="whisper-large-v3-turbo",
                 response_format="json",
                 temperature=0.0,
             )
-    text = getattr(transcription, "text", "") or ""
-    return text.strip()
+
+        # Depending on Groq SDK response type:
+        return transcription.text if hasattr(transcription, "text") else transcription.get("text", "")
+
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.remove(tmp_path)
 
 
 # =========================

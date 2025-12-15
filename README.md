@@ -186,10 +186,31 @@ docs/
 
 ## Upload Knowledge Base (KB)
 
+### macOS / Linux
+
 ```bash
 curl -X POST http://localhost:8000/upload_kb \
   -F "file=@your_document.docx"
 ```
+
+### Windows (PowerShell or Command Prompt)
+
+```powershell
+curl.exe -X POST http://localhost:8000/upload_kb `
+  -F "file=@your_document.docx"
+```
+
+### Windows (PowerShell-native)
+
+```powershell
+Invoke-RestMethod `
+  -Uri "http://localhost:8000/upload_kb" `
+  -Method Post `
+  -Form @{ file = Get-Item "your_document.docx" }
+```
+
+> **Note:** In PowerShell, `curl` is an alias for `Invoke-WebRequest` and does **not** support `-F`.  
+> Always use `curl.exe` or the PowerShell-native example above.
 
 ---
 
